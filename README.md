@@ -3,55 +3,74 @@
 Fast line-following robot for **MECC 2026** — ESP32 + dual H-bridge motor driver + 5 digital IR
 sensors.
 
-The robot steers with a **PD controller** running a **1 kHz** control loop. All 5 sensors are
+The robot steers with a **PD controller** running a **1 kHz** control loop. All five sensors are
 read in a single direct GPIO register access (`GPIO.in`) instead of five `digitalRead()` calls,
-which leaves plenty of headroom for the fast loop.
+so the fast loop costs almost nothing. Build: **284,099 bytes (21% of flash)**, 22,392 bytes of
+RAM.
 
-## Sensor layout and turning logic
+## How it drives
 
-The five sensors are not all used for line following. Three in the middle track the line, and
-the two on the outside watch for the black boxes on the track:
+The five sensors do two different jobs. Three in the middle track the line; the two on the
+outside watch for the black boxes on the track:
 
 ```
-   left side                                             right side
-      │                                                       │
-    IR1 ─────── IR2 ── IR3 ── IR4 ─────── IR5
-   LEFT BOX     mid-    centre   mid-    RIGHT BOX
-     -4         left     0      right       +4
-                -2               +2
+        left                                             right
+   ┌────────────┐                                  ┌────────────┐
+   │ IR1  GPIO23│                                  │ IR5  GPIO18│
+   │ BOX sensor │                                  │ BOX sensor │
+   └────────────┘                                  └────────────┘
+                  ┌────────┐ ┌────────┐ ┌────────┐
+                  │  IR2   │ │  IR3   │ │  IR4   │
+                  │  GPIO22│ │  GPIO21│ │  GPIO19│
+                  └────────┘ └────────┘ └────────┘
+                    mid-left   centre    mid-right
+                    weight -2  weight 0  weight +2
 ```
 
 | Rule | Behaviour |
 |---|---|
-| **IR3 (centre)** sees the line | robot follows it straight |
+| **IR3 (centre)** sees the line | follow it straight |
 | Line drifts under **IR2 / IR4** | PD controller steers back to centre |
 | **IR1 (left box)** sees a box | the **next decision steers LEFT** |
 | **IR5 (right box)** sees a box | the **next decision steers RIGHT** |
+| Box on both sides at once | the two cancel, no bias |
 | **All three middle sensors** dark (thick box) | the robot **TURNS** |
 | No middle sensor sees the line | search turn toward `lastSide`, stop after 3 s |
 
-A box is never allowed to pull the line error: the outer sensors contribute a separate,
-short-lived steering kick (`boxKick`) that fades out over `BOX_HOLD_MS`, so the robot shifts
-sideways and then settles back onto the line.
+The outer sensors never enter the line error — a box must not drag the robot off the line.
+Instead each box sets a **latched steering bias** that lands on the next decision and fades out
+over `BOX_HOLD_MS`, so the robot actually shifts sideways instead of twitching for one 1 ms
+cycle. The kick is `boxKick` PWM units, added on top of the PD correction.
 
-A thick box (all three middle sensors dark) triggers a pivot turn for `turnMs` at `turnSpeed`,
-toward the box that was just detected, otherwise toward the direction the line was already
-curving. After the turn the robot resumes following the line, and the same mark is ignored for
-`TURN_REARM_MS` so it cannot trigger twice.
+A **thick box** (all three middle sensors dark) suspends line following: the robot pivots for
+`turnMs` at `turnSpeed`, turning toward the box it just passed, else the way the line was
+already curving, else right. Then it re-acquires the line, and the same mark is ignored for
+`TURN_REARM_MS` so one box cannot trigger two turns.
 
-## Parameters
+## Parameters you can change over serial
 
-| Parameter | Default | Meaning |
+| Parameter | Default | Command | Meaning |
+|---|---|---|---|
+| `Kp` | 40 | `p` | Proportional gain — how hard it corrects |
+| `Kd` | 60 | `d` | Derivative gain — damping against wobble |
+| `baseSpeed` | 240 | `s` | PWM on straights (0–255) |
+| `slowK` | 20 | `k` | How much it slows down in corners |
+| `minSpeed` | 120 | — | Lowest PWM while tracking |
+| `pivotSpeed` | 180 | `m` | PWM used to spin and re-find the line |
+| `boxKick` | 80 | `b` | Steering kick when a side sensor sees a box |
+| `turnSpeed` | 170 | `u` | PWM for the thick-box pivot turn |
+| `turnMs` | 450 | `w` | Duration of the thick-box pivot turn (ms) |
+
+## Fixed constants (change in the sketch, re-upload)
+
+| Constant | Value | Meaning |
 |---|---|---|
-| `Kp` | 40 | Proportional gain — how hard it corrects |
-| `Kd` | 60 | Derivative gain — damping against wobble |
-| `baseSpeed` | 240 | PWM on straights (0–255) |
-| `slowK` | 20 | How much it slows down in corners |
-| `minSpeed` | 120 | Lowest PWM while tracking |
-| `pivotSpeed` | 180 | PWM used to spin and re-find the line |
-| `boxKick` | 80 | Steering kick added when a side sensor sees a box |
-| `turnSpeed` | 170 | PWM for the thick-box pivot turn |
-| `turnMs` | 450 | Duration of the thick-box pivot turn |
+| `CONTROL_US` | 1000 | Control period — 1 ms, i.e. 1 kHz |
+| `BOX_HOLD_MS` | 120 | How long a box steer kick lasts |
+| `TURN_REARM_MS` | 300 | Cooldown before a thick box can trigger again |
+| `LOST_STOP_MS` | 3000 | Stop after the line has been lost this long |
+| `MIN_PWM` | 60 | Dead-zone floor so motors actually turn |
+| `PWM_FREQ` | 5000 | Motor PWM frequency (Hz), 8-bit resolution |
 
 ## Hardware
 
@@ -97,7 +116,9 @@ A printable walkthrough with troubleshooting is included:
 ## Running
 
 - Press **BOOT** once to start, again to stop.
-- Open the Serial Monitor at **115200 baud** to see telemetry and tune live:
+- Open the Serial Monitor at **115200 baud**. `v` prints both parameter lines; the startup line
+  `Sensors  Lbox:0  line:010  Rbox:0` shows what each sensor sees right now — hand-test it by
+  sliding the robot over the line and over a box before every run.
 
 ```
 p 45      set Kp
@@ -109,11 +130,37 @@ b 80      set box steer kick
 u 170     set thick-box turn speed
 w 450     set thick-box turn duration (ms)
 v         print current parameters
-t         wheel test
+t         wheel test (robot must be stopped)
 ```
 
-If it **cuts corners**, increase `Kp`. If it **oscillates/zig-zags**, increase `Kd`.
-If it flies off on fast corners, lower `baseSpeed` or raise `slowK`.
-If it ignores the boxes, raise `boxKick`. If the box shift is too violent, lower it.
+Tuning, in the order it matters:
 
-If the line is lost for 3 seconds the robot stops automatically.
+- Cuts corners → raise `Kp`. Zig-zags → raise `Kd`.
+- Flies off on fast corners → lower `baseSpeed` or raise `slowK`.
+- Ignores the boxes → raise `boxKick`; shifts too violently → lower it.
+- Overturns on junctions or manhole-sized marks → lower `w` (try 250) or `u` (try 140).
+
+## First-run checklist
+
+1. `t` over serial with the robot lifted — both wheels turn the right way. Fix
+   `LEFT_INVERT` / `RIGHT_INVERT` if not.
+2. Slide the robot across the line by hand and watch `Sensors ... line:...` — the middle bits
+   must change. If nothing changes, check the sensor polarity and wiring.
+3. Slide a box past each outer sensor — `Lbox:` / `Rbox:` must flip to 1.
+4. Only then press **BOOT** and let it run, starting with `baseSpeed` around 150 and raising it.
+
+## Repo contents
+
+| File | Purpose |
+|---|---|
+| `FastLineFollower.ino` | the sketch |
+| `README.md` | this document |
+| `ESP32_LineFollower_Setup.pdf` | printable IDE setup guide with troubleshooting |
+
+## Known limits
+
+- The gains are first guesses for the box behaviour — they have not been tested on a track yet.
+- The thick-box rule is defined purely as "three middle sensors dark", so any wide black region
+  fires it, not only actual boxes.
+- Detection distance is whatever the IR modules give you; they see the surface, not obstacles
+  standing up.
