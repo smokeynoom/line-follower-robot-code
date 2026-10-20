@@ -62,13 +62,31 @@ Then the robot:
 | `c 0` | no creep: spin the moment the sensors hit the box (sensors far from the axle) |
 | `c 60`–`c 150` | creep longer if it turns too early and cuts the junction |
 
+### Going faster
+
+| Idea | How it works here |
+|---|---|
+| Damping that actually damps | `Kd` acts on the error change over the last **32 ms**, not the last 1 ms. On/off sensors jump, so a 1 ms derivative was a spike the motors never felt, and the robot ran on P alone and wobbled. |
+| Full speed on straights | after IR3 alone has held the line for 100 ms, speed ramps from `baseSpeed` up to `boostSpeed` over 300 ms |
+| Brake before curves | `z 15` reverses both motors for 15 ms when the line drifts off centre after a boosted straight (off by default) |
+| Don't stop when the line slips | 150 ms hard arc toward the line before spinning in place |
+
+A fast setup to try, in this order: `s 200` (corner-safe) with `f 255`, then raise `s` until it
+flies off a curve, then add `z 15` and raise `s` again.
+
+Hardware ideas from fast competition robots (no code change needed):
+mount the sensor bar **further in front of the wheels**, so it sees curves earlier; keep the
+weight between the wheels; use grippy, clean tyres; raise the motor supply voltage.
+
 ## Parameters you can change over serial
 
 | Parameter | Default | Command | Meaning |
 |---|---|---|---|
 | `Kp` | 40 | `p` | Proportional gain — how hard it corrects |
-| `Kd` | 60 | `d` | Derivative gain — damping against wobble |
-| `baseSpeed` | 240 | `s` | PWM on straights (0–255) |
+| `Kd` | 25 | `d` | Derivative gain (over 32 ms) — damping against wobble |
+| `baseSpeed` | 240 | `s` | Normal PWM, also what curves start from (0–255) |
+| `boostSpeed` | 255 | `f` | PWM it ramps up to on long straights |
+| `brakeMs` | 0 | `z` | Reverse pulse when leaving a boosted straight (ms, 0 = off) |
 | `slowK` | 20 | `k` | How much it slows down in corners |
 | `minSpeed` | 120 | — | Lowest PWM while tracking |
 | `pivotSpeed` | 180 | `m` | PWM used to spin and re-find the line |
@@ -83,6 +101,8 @@ Then the robot:
 | Constant | Value | Meaning |
 |---|---|---|
 | `CONTROL_US` | 1000 | Control period — 1 ms, i.e. 1 kHz |
+| `D_WINDOW` | 32 | D term looks back this many samples (ms) |
+| `BOOST_AFTER_MS` / `BOOST_RAMP_MS` | 100 / 300 | Straight needed before boost / time to reach full boost |
 | `BOX_HOLD_MS` | 120 | How long the optional nudge lasts |
 | `MARK_MIN_SAMPLES` | 3 | Side box must stay dark this many ms to count |
 | `THICK_CONFIRM` | 3 | Thick box must stay dark this many ms to fire |
@@ -142,8 +162,10 @@ A printable walkthrough with troubleshooting is included:
 
 ```
 p 45      set Kp
-d 55      set Kd
+d 25      set Kd
 s 230     set base speed
+f 255     set straight boost speed
+z 15      curve brake on (z 0 = off)
 k 18      set corner slow-down
 m 170     set pivot/search speed
 y 1       box nudge on (y 0 = off)
@@ -157,7 +179,8 @@ t         wheel test (robot must be stopped)
 
 Tuning, in the order it matters:
 
-- Cuts corners → raise `Kp`. Zig-zags → raise `Kd`.
+- Cuts corners → raise `Kp`. Zig-zags → raise `Kd`. (Old `Kd` values don't carry over: the
+  D term now works over 32 ms, so 25 here is much stronger than the old 60.)
 - Flies off on fast corners → lower `baseSpeed` or raise `slowK`.
 - Turns the wrong way → `v` shows `pending=` (-1 left, 1 right); slide a box past each side
   sensor by hand and check it changes.

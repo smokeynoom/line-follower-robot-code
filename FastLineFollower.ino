@@ -17,8 +17,10 @@
   Serial Monitor @ 115200:
 
     p 30    -> Set Kp
-    d 80    -> Set Kd
+    d 25    -> Set Kd
     s 210   -> Set base speed
+    f 255   -> Set straight boost speed
+    z 15    -> Set curve brake (ms, 0 = off)
     k 25    -> Set corner slow-down
     m 170   -> Set pivot/search speed
     b 70    -> Set box steer kick
@@ -157,9 +159,20 @@ const int MIN_PWM = 60;
 // PD gains — retuned for 1 kHz loop and higher speed.
 // Increase Kp if robot cuts corners; increase Kd if it oscillates.
 float Kp = 40.0f;
-float Kd = 60.0f;
+float Kd = 25.0f;
 
 int baseSpeed = 240;
+
+// Straights: once IR3 alone has seen the line for BOOST_AFTER_MS,
+// speed ramps from baseSpeed up to boostSpeed over BOOST_RAMP_MS.
+// For a fast run lower baseSpeed (corner-safe) and keep boost high.
+int boostSpeed = 255;
+const uint32_t BOOST_AFTER_MS = 100;
+const uint32_t BOOST_RAMP_MS = 300;
+
+// Leaving a boosted straight: reverse both motors this long to
+// shed speed before the curve. 0 = off. Try 10-30.
+int brakeMs = 0;
 
 // Speed reduction for larger line error (lower = less slow-down)
 float slowK = 20.0f;
@@ -210,6 +223,12 @@ const uint32_t TURN_REARM_MS = 300;
 // CONTROL SETTINGS
 // ============================================================
 
+// The D term compares the error with the error D_WINDOW samples
+// ago (32 ms at 1 kHz). On/off sensors change in jumps, so a
+// sample-to-sample derivative is a 1 ms spike the motors never feel;
+// over 32 ms it lasts long enough to damp the wobble. Power of two.
+const uint8_t D_WINDOW = 32;
+
 // 1000 microseconds = 1 ms = 1000 Hz
 // 2x faster reaction vs previous 500 Hz — sensor reads
 // are now fast enough to keep up.
@@ -231,8 +250,14 @@ const uint32_t BUTTON_DEBOUNCE_MS = 400;
 
 bool running = false;
 
-float lastError = 0.0f;
-float dFilt = 0.0f;
+// Recent errors for the D term (ring buffer)
+int8_t errHist[D_WINDOW];
+uint8_t errIdx = 0;
+
+// Straight boost / curve brake
+uint32_t centredSince = 0;
+int lastSpeed = 0;
+uint32_t brakeUntil = 0;
 
 // -1 = line last seen on left
 // +1 = line last seen on right
@@ -415,6 +440,13 @@ int readSensors(float &error, bool &leftBox, bool &rightBox, bool &centre) {
   return count;
 }
 
+// Forget the error history (start, and after a turn) so the D term
+// does not kick on stale data
+void resetD() {
+  memset(errHist, 0, sizeof(errHist));
+  errIdx = 0;
+}
+
 // ============================================================
 // SIDE BOX TRACKING
 // ============================================================
@@ -529,10 +561,12 @@ void wheelTest() {
 void printParams() {
 
   Serial.printf(
-    "Kp=%.1f  Kd=%.1f  base=%d  slowK=%.1f  min=%d  pivot=%d\n",
+    "Kp=%.1f  Kd=%.1f  base=%d  boost=%d  brakeMs=%d  slowK=%.1f  min=%d  pivot=%d\n",
     Kp,
     Kd,
     baseSpeed,
+    boostSpeed,
+    brakeMs,
     slowK,
     minSpeed,
     pivotSpeed
@@ -640,6 +674,16 @@ void handleSerial() {
       Serial.println("Thick-box turn timeout updated.");
       break;
 
+    case 'f':
+      boostSpeed = constrain((int)value, 0, 255);
+      Serial.println("Boost speed updated.");
+      break;
+
+    case 'z':
+      brakeMs = constrain((int)value, 0, 100);
+      Serial.println("Curve brake updated.");
+      break;
+
     case 'c':
       creepMs = constrain((int)value, 0, 500);
       Serial.println("Creep before turn updated.");
@@ -652,7 +696,7 @@ void handleSerial() {
 
     default:
       Serial.println("Unknown command.");
-      Serial.println("Use: p, d, s, k, m, b, u, w, c, y, v, t");
+      Serial.println("Use: p, d, s, f, z, k, m, b, u, w, c, y, v, t");
       return;
   }
 
@@ -765,8 +809,9 @@ void loop() {
       delay(800);
 
       // Reset controller
-      lastError = 0.0f;
-      dFilt = 0.0f;
+      resetD();
+      centredSince = 0;
+      brakeUntil = 0;
       lostSince = 0;
       lastSide = 0;
 
@@ -860,8 +905,8 @@ void loop() {
     phase = FOLLOW;
     turnRearmAt = nowMs + TURN_REARM_MS;
     lastSide = turnDir;
-    lastError = 0.0f;
-    dFilt = 0.0f;
+    resetD();
+    centredSince = 0;
     lostSince = 0;
   }
 
@@ -984,19 +1029,15 @@ void loop() {
   // Proportional term
   float proportional = error;
 
-  // Derivative term
-  float derivative = error - lastError;
-
-  // Low-pass filter derivative
-  dFilt += 0.35f * (derivative - dFilt);
-
-  // Save current error
-  lastError = error;
+  // Derivative term: change over the last D_WINDOW ms
+  float derivative = error - errHist[errIdx];
+  errHist[errIdx] = (int8_t)error;
+  errIdx = (errIdx + 1) & (D_WINDOW - 1);
 
   // Calculate steering correction
   float correction =
     (Kp * proportional) +
-    (Kd * dFilt);
+    (Kd * derivative);
 
   // Optional nudge toward a side box, fading out over BOX_HOLD_MS
   if (nudge && (int32_t)(nudgeUntil - nowMs) > 0) {
@@ -1020,6 +1061,43 @@ void loop() {
   // Do not go below minimum speed
   if (speed < minSpeed) {
     speed = minSpeed;
+  }
+
+  // Straight boost: IR3 alone on the line -> ramp up to boostSpeed
+  if (midCount == 1 && centre) {
+
+    if (centredSince == 0) {
+      centredSince = nowMs;
+    }
+
+    uint32_t onStraight = nowMs - centredSince;
+
+    if (onStraight > BOOST_AFTER_MS && boostSpeed > speed) {
+
+      uint32_t t = onStraight - BOOST_AFTER_MS;
+
+      if (t > BOOST_RAMP_MS) {
+        t = BOOST_RAMP_MS;
+      }
+
+      speed += (int)((boostSpeed - speed) * t / BOOST_RAMP_MS);
+    }
+  }
+  else {
+
+    // Coming off a boosted straight: brake before the curve
+    if (centredSince != 0 && brakeMs > 0 && lastSpeed > baseSpeed + 5) {
+      brakeUntil = nowMs + (uint32_t)brakeMs;
+    }
+
+    centredSince = 0;
+  }
+
+  lastSpeed = speed;
+
+  if ((int32_t)(brakeUntil - nowMs) > 0) {
+    setMotors(-255, -255);
+    return;
   }
 
   // ==========================================================

@@ -66,5 +66,30 @@ int main() {
   run(200);
   assert(leftMotor() > 0 && rightMotor() < 0);
 
-  puts("all box/turn checks passed");
+  // D term lasts tens of ms, not one sample: a step 0 -> +1 steers
+  // harder at 10 ms (P + D) than at 50 ms (P only)
+  start();
+  see(0,0,1,1,0); run(10);
+  int early = leftMotor() - rightMotor();
+  run(40);
+  int late = leftMotor() - rightMotor();
+  assert(early > late && late > 0);
+
+  // Straight boost: base 200 ramps up to boost 255
+  start();
+  baseSpeed = 200; boostSpeed = 255;
+  see(0,0,1,0,0); run(20);
+  assert(leftMotor() == 200);
+  run(500);
+  assert(leftMotor() == 255 && rightMotor() == 255);
+
+  // Curve brake: leaving the boosted straight reverses both briefly
+  brakeMs = 15;
+  see(0,0,1,1,0); run(5);
+  assert(leftMotor() < 0 && rightMotor() < 0);
+  run(15);
+  assert(leftMotor() > rightMotor() && rightMotor() >= 0);
+  brakeMs = 0; baseSpeed = 240;
+
+  puts("all box/turn/speed checks passed");
 }
