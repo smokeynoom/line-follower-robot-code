@@ -2,7 +2,7 @@
   MECC 2026 - Fast Line Follower
 
   Board : ESP32 Dev Module
-  Driver: L298N-style dual H-bridge
+  Motors: 2x DC gear motors via a dual H-bridge driver board
   Sensors: 5x digital IR modules
 
   IMPORTANT:
@@ -21,27 +21,38 @@
     s 210   -> Set base speed
     k 25    -> Set corner slow-down
     m 170   -> Set pivot/search speed
+    b 70    -> Set box steer kick
+    u 170   -> Set thick-box turn speed
+    w 450   -> Set thick-box turn duration (ms)
     v       -> Show current parameters
     t       -> Wheel test
 
-  Sensor order:
-    IR1 = far LEFT  (GPIO23)
-    IR2 = LEFT      (GPIO22)
-    IR3 = CENTER    (GPIO21)
-    IR4 = RIGHT     (GPIO19)
-    IR5 = far RIGHT (GPIO18)
+  SENSOR LAYOUT (left to right as seen from behind the robot):
+
+    IR1 = LEFT  BOX sensor   (GPIO23)  looks off the line, left side
+    IR2 = line, middle LEFT  (GPIO22)
+    IR3 = line, CENTRE       (GPIO21)  the sensor that tracks the line
+    IR4 = line, middle RIGHT (GPIO19)
+    IR5 = RIGHT BOX sensor   (GPIO18)  looks off the line, right side
+
+  TURNING LOGIC:
+    * IR3 follows the line; IR2 / IR4 help as soon as it drifts.
+    * LEFT box sensor sees a box  -> next decision steers LEFT.
+    * RIGHT box sensor sees a box -> next decision steers RIGHT.
+    * All 3 middle sensors dark (thick box) -> the robot TURNS.
+    * Anything else -> normal PD line following.
 
   Assumption:
     IR modules are ACTIVE-LOW:
-      LOW  = line detected
-      HIGH = no line
+      LOW  = dark / line or box detected
+      HIGH = bright surface
 
   If robot steers AWAY from the line:
     FLIP_STEERING = true
 
   PERFORMANCE OPTIMISATIONS:
     * All 5 IR sensors are read in ONE direct GPIO register
-      access (GPIO.in1) instead of five digitalRead() calls.
+      access (GPIO.in) instead of five digitalRead() calls.
       ~100x faster sensor read.
     * Control loop runs at 1 kHz (was 500 Hz).
     * PD gains retuned for higher-speed tracking.
@@ -52,6 +63,10 @@
 // ============================================================
 
 #include <Arduino.h>
+
+// gpio_dev_t / GPIO — register-level GPIO struct shipped with the
+// ESP32 core. GPIO.in holds GPIO0-31, so all five sensors are one load.
+#include "soc/gpio_struct.h"
 
 // ============================================================
 // PIN DEFINITIONS
@@ -67,32 +82,33 @@ const uint8_t IR_PINS[5] = {
 // DIRECT GPIO REGISTER MASKS  (fast sensor read)
 // ============================================================
 
-// GPIO18-23 all live in GPIO.in1 (register at 0x3FF44008).
-// Bit N in GPIO.in1 = physical GPIO (N + 18).
-// We pre-compute a bitmask so readLine() reads ONE register
-// and tests five bits — no function-call overhead at all.
+// All five sensors sit on GPIO18-23, which live in the low input
+// register (GPIO.in), so ALL FIVE are read in ONE 32-bit load.
+// Bit N of GPIO.in = physical GPIO N.
 //
-//   IR1 (GPIO23) -> bit 5   mask 0x20
-//   IR2 (GPIO22) -> bit 4   mask 0x10
-//   IR3 (GPIO21) -> bit 3   mask 0x08
-//   IR4 (GPIO19) -> bit 1   mask 0x02
-//   IR5 (GPIO18) -> bit 0   mask 0x01
+//   IR1 (GPIO23) -> bit 23   1 << 23    LEFT  BOX
+//   IR2 (GPIO22) -> bit 22   1 << 22    line, mid-left
+//   IR3 (GPIO21) -> bit 21   1 << 21    line, centre
+//   IR4 (GPIO19) -> bit 19   1 << 19    line, mid-right
+//   IR5 (GPIO18) -> bit 18   1 << 18    RIGHT BOX
 //
-//   SENSOR_MASK = 0x3B  (bits 0,1,3,4,5)
+// Each mask is written next to its own pin number, so a sensor can
+// never end up wired to the wrong bit.
+static const uint32_t M_IR1 = (1u << 23);
+static const uint32_t M_IR2 = (1u << 22);
+static const uint32_t M_IR3 = (1u << 21);
+static const uint32_t M_IR4 = (1u << 19);
+static const uint32_t M_IR5 = (1u << 18);
 
-static const uint32_t SENSOR_MASK = 0x3B;
+static const uint32_t SENSOR_MASK =
+  M_IR1 | M_IR2 | M_IR3 | M_IR4 | M_IR5;
 
-// Bit positions within GPIO.in1 (bit = GPIO pin - 18)
-static const uint8_t SENSOR_BITS[5] = { 5, 4, 3, 1, 0 };
-
-// Weighted sum lookup: applied when sensor bit is LOW (line)
-static const float SENSOR_WEIGHTS[5] = {
-  -4.0f,   // IR1 far LEFT
-  -2.0f,   // IR2 LEFT
-   0.0f,   // IR3 CENTER
-   2.0f,   // IR4 RIGHT
-   4.0f    // IR5 far RIGHT
-};
+// Line-following weights — MIDDLE sensors only.
+// The two outer sensors detect boxes and never contribute to the
+// line error, otherwise a box would drag the robot off the line.
+static const float W_MID_LEFT  = -2.0f;   // IR2
+static const float W_CENTRE    =  0.0f;   // IR3
+static const float W_MID_RIGHT =  2.0f;   // IR4
 
 // Left motor direction pins
 const int IN1 = 27;
@@ -150,6 +166,27 @@ int minSpeed = 120;
 // Search/pivot speed when line is lost
 int pivotSpeed = 180;
 
+// ------------------------------------------------------------
+// BOX PARAMETERS
+// ------------------------------------------------------------
+
+// How hard the robot steers when a SIDE sensor sees a box
+// (added to the PD correction, in PWM units)
+float boxKick = 80.0f;
+
+// How long that steering kick lasts after the box is seen.
+// 120 ms at ~2 m/s pushes the robot a few cm sideways.
+const uint32_t BOX_HOLD_MS = 120;
+
+// Thick box = all three middle sensors dark. The robot pivots
+// for turnMs at turnSpeed, then goes back to following the line.
+int turnSpeed = 170;
+int turnMs = 450;
+
+// Once a thick box has been handled, ignore it for this long so
+// the same mark cannot trigger a second turn
+const uint32_t TURN_REARM_MS = 300;
+
 // ============================================================
 // CONTROL SETTINGS
 // ============================================================
@@ -182,6 +219,20 @@ int lastSide = 0;
 uint32_t lostSince = 0;
 uint32_t lastCtrl = 0;
 uint32_t lastButtonPress = 0;
+
+// ------------------------------------------------------------
+// BOX STATE
+// ------------------------------------------------------------
+
+// -1 = steer left, +1 = steer right, 0 = no box seen
+float boxBias = 0.0f;
+uint32_t boxBiasUntil = 0;
+
+// Thick-box turn in progress
+bool turning = false;
+int turnDir = 0;
+uint32_t turnUntil = 0;
+uint32_t turnRearmAt = 0;
 
 // ============================================================
 // MOTOR CONTROL
@@ -263,6 +314,18 @@ void stopMotors() {
   setMotors(0, 0);
 }
 
+
+// Spin in place. dir > 0 = turn RIGHT, dir < 0 = turn LEFT
+void pivot(int dir) {
+
+  if (dir > 0) {
+    setMotors(turnSpeed, -turnSpeed);
+  }
+  else {
+    setMotors(-turnSpeed, turnSpeed);
+  }
+}
+
 // ============================================================
 // SENSOR READING  (direct GPIO register — no digitalRead)
 // ============================================================
@@ -270,48 +333,43 @@ void stopMotors() {
 /*
   Reads all 5 IR sensors in a SINGLE GPIO register access.
 
-  GPIO18-23 are all in GPIO.in1.  We read the 32-bit register
-  once, test the five sensor bits, and accumulate the weighted
-  sum — all without any function calls.
-
   Returns:
-    Number of sensors detecting the line (count)
+    Number of MIDDLE sensors that see the line (0..3)
 
   error:
-    Weighted average position of the line
+    Weighted position of the line under the three middle sensors
 
-    IR1 (far LEFT)  -> -4
-    IR2 (LEFT)      -> -2
-    IR3 (CENTER)     ->  0
-    IR4 (RIGHT)      -> +2
-    IR5 (far RIGHT) -> +4
+      IR2 (mid-LEFT)  -> -2
+      IR3 (CENTRE)    ->  0
+      IR4 (mid-RIGHT) -> +2
+
+  leftBox / rightBox:
+    true when the matching outer sensor sees a box
+
+  The two outer sensors are NOT part of the line error — they only
+  report boxes, which the main loop turns into a steering kick.
 */
 
 __attribute__((always_inline))
-int readLine(float &error) {
+int readSensors(float &error, bool &leftBox, bool &rightBox) {
 
   // ONE register read replaces five digitalRead() calls
-  uint32_t gpio = *(volatile uint32_t*)0x3FF44008;  // GPIO.in1
+  const uint32_t gpio = GPIO.in;
 
-  // Active-LOW: sensor reads 0 when line is detected
-  uint32_t active = (~gpio) & SENSOR_MASK;
+  // Active-LOW: a sensor reads 0 when it sees dark
+  const uint32_t active = (~gpio) & SENSOR_MASK;
 
-  int   count = __builtin_popcount(active);
+  leftBox  = (active & M_IR1) != 0;
+  rightBox = (active & M_IR5) != 0;
+
+  int   count = 0;
   float sum   = 0.0f;
 
-  if (count > 0) {
+  if (active & M_IR2) { sum += W_MID_LEFT;  count++; }
+  if (active & M_IR3) { sum += W_CENTRE;    count++; }
+  if (active & M_IR4) { sum += W_MID_RIGHT; count++; }
 
-    if (active & 0x01) sum += SENSOR_WEIGHTS[0];  // IR1
-    if (active & 0x02) sum += SENSOR_WEIGHTS[1];  // IR2
-    if (active & 0x08) sum += SENSOR_WEIGHTS[2];  // IR3
-    if (active & 0x10) sum += SENSOR_WEIGHTS[3];  // IR4
-    if (active & 0x20) sum += SENSOR_WEIGHTS[4];  // IR5
-
-    error = sum / (float)count;
-  }
-  else {
-    error = 0.0f;
-  }
+  error = (count > 0) ? (sum / (float)count) : 0.0f;
 
   if (FLIP_STEERING) {
     error = -error;
@@ -326,18 +384,20 @@ int readLine(float &error) {
 
 void printSensors() {
 
-  Serial.print("Sensors: ");
+  bool leftBox  = (digitalRead(IR_PINS[0]) == LINE_DETECTED);
+  bool midLeft  = (digitalRead(IR_PINS[1]) == LINE_DETECTED);
+  bool centre   = (digitalRead(IR_PINS[2]) == LINE_DETECTED);
+  bool midRight = (digitalRead(IR_PINS[3]) == LINE_DETECTED);
+  bool rightBox = (digitalRead(IR_PINS[4]) == LINE_DETECTED);
 
-  for (int i = 0; i < 5; i++) {
-
-    Serial.print(digitalRead(IR_PINS[i]));
-
-    if (i < 4) {
-      Serial.print(" ");
-    }
-  }
-
-  Serial.println();
+  Serial.printf(
+    "Sensors  Lbox:%d  line:%d%d%d  Rbox:%d\n",
+    leftBox,
+    midLeft,
+    centre,
+    midRight,
+    rightBox
+  );
 }
 
 // ============================================================
@@ -404,6 +464,13 @@ void printParams() {
     slowK,
     minSpeed,
     pivotSpeed
+  );
+
+  Serial.printf(
+    "boxKick=%.1f  turnSpeed=%d  turnMs=%d\n",
+    boxKick,
+    turnSpeed,
+    turnMs
   );
 }
 
@@ -483,9 +550,24 @@ void handleSerial() {
       Serial.println("Pivot speed updated.");
       break;
 
+    case 'b':
+      boxKick = value;
+      Serial.println("Box steer kick updated.");
+      break;
+
+    case 'u':
+      turnSpeed = constrain((int)value, 0, 255);
+      Serial.println("Thick-box turn speed updated.");
+      break;
+
+    case 'w':
+      turnMs = constrain((int)value, 0, 2000);
+      Serial.println("Thick-box turn duration updated.");
+      break;
+
     default:
       Serial.println("Unknown command.");
-      Serial.println("Use: p, d, s, k, m, v, t");
+      Serial.println("Use: p, d, s, k, m, b, u, w, v, t");
       return;
   }
 
@@ -603,6 +685,14 @@ void loop() {
       lostSince = 0;
       lastSide = 0;
 
+      // Reset box handling
+      boxBias = 0.0f;
+      boxBiasUntil = 0;
+      turning = false;
+      turnDir = 0;
+      turnUntil = 0;
+      turnRearmAt = 0;
+
       lastCtrl = micros();
 
       Serial.println("RUN");
@@ -636,18 +726,100 @@ void loop() {
   lastCtrl = now;
 
   // ----------------------------------------------------------
-  // READ LINE
+  // READ SENSORS
   // ----------------------------------------------------------
 
   float error = 0.0f;
+  bool  leftBox  = false;
+  bool  rightBox = false;
 
-  int count = readLine(error);
+  int midCount = readSensors(error, leftBox, rightBox);
+
+  uint32_t nowMs = millis();
+
+  // ==========================================================
+  // BOX SEEN BY A SIDE SENSOR
+  // ==========================================================
+
+  /*
+    LEFT  box sensor sees a box -> steer LEFT
+    RIGHT box sensor sees a box -> steer RIGHT
+
+    The choice is LATCHED and applied to the next decision, then
+    fades over BOX_HOLD_MS, so it actually moves the robot
+    sideways instead of twitching for a single 1 ms cycle.
+  */
+
+  if (leftBox && !rightBox) {
+
+    boxBias = -1.0f;                       // negative = left
+    boxBiasUntil = nowMs + BOX_HOLD_MS;
+  }
+  else if (rightBox && !leftBox) {
+
+    boxBias = 1.0f;                        // positive = right
+    boxBiasUntil = nowMs + BOX_HOLD_MS;
+  }
+  else if (leftBox && rightBox) {
+
+    // Boxes on both sides cancel out
+    boxBias = 0.0f;
+    boxBiasUntil = 0;
+  }
+
+  // ==========================================================
+  // THICK BOX  (all three middle sensors dark)
+  // ==========================================================
+
+  if (turning) {
+
+    // Still inside a turn: keep pivoting until the timer expires
+    if ((int32_t)(nowMs - turnUntil) < 0) {
+
+      pivot(turnDir);
+      return;
+    }
+
+    // Turn finished
+    turning = false;
+    turnRearmAt = nowMs + TURN_REARM_MS;
+
+    // Drop the stale PD state so the robot does not lurch
+    lastError = 0.0f;
+    dFilt = 0.0f;
+  }
+  else if (
+    midCount >= 3 &&
+    (int32_t)(nowMs - turnRearmAt) >= 0
+  ) {
+
+    // Turn toward the box we just passed, otherwise keep turning
+    // the way the line was already curving
+    int dir;
+
+    if (boxBias != 0.0f) {
+      dir = (boxBias < 0.0f) ? -1 : 1;
+    }
+    else if (lastSide != 0) {
+      dir = lastSide;
+    }
+    else {
+      dir = 1;                             // default: turn right
+    }
+
+    turnDir = dir;
+    turnUntil = nowMs + (uint32_t)turnMs;
+    turning = true;
+
+    pivot(dir);
+    return;
+  }
 
   // ==========================================================
   // LINE LOST
   // ==========================================================
 
-  if (count == 0) {
+  if (midCount == 0) {
 
     // Start lost timer
     if (lostSince == 0) {
@@ -740,6 +912,15 @@ void loop() {
   float correction =
     (Kp * proportional) +
     (Kd * dFilt);
+
+  // Add the box steering kick, fading out over BOX_HOLD_MS
+  if (boxBias != 0.0f && (int32_t)(boxBiasUntil - nowMs) > 0) {
+
+    float weight =
+      (float)(boxBiasUntil - nowMs) / (float)BOX_HOLD_MS;
+
+    correction += boxBias * boxKick * weight;
+  }
 
   // ==========================================================
   // SPEED CONTROL
