@@ -23,7 +23,9 @@
     m 170   -> Set pivot/search speed
     b 70    -> Set box steer kick
     u 170   -> Set thick-box turn speed
-    w 450   -> Set thick-box turn duration (ms)
+    w 1200  -> Set thick-box turn timeout (ms)
+    c 60    -> Set forward creep before the turn (ms)
+    y 0/1   -> Box nudge off / on
     v       -> Show current parameters
     t       -> Wheel test
 
@@ -37,9 +39,11 @@
 
   TURNING LOGIC:
     * IR3 follows the line; IR2 / IR4 help as soon as it drifts.
-    * LEFT box sensor sees a box  -> next decision steers LEFT.
-    * RIGHT box sensor sees a box -> next decision steers RIGHT.
-    * All 3 middle sensors dark (thick box) -> the robot TURNS.
+    * LEFT box sensor passes a box  -> the next turn goes LEFT.
+    * RIGHT box sensor passes a box -> the next turn goes RIGHT.
+      (Remembered until the turn uses it; the latest box wins.)
+    * All 3 middle sensors dark (thick box) -> creep forward, then
+      spin until IR3 finds the line again.
     * Anything else -> normal PD line following.
 
   Assumption:
@@ -170,21 +174,36 @@ int pivotSpeed = 180;
 // BOX PARAMETERS
 // ------------------------------------------------------------
 
-// How hard the robot steers when a SIDE sensor sees a box
-// (added to the PD correction, in PWM units)
+// A side box sets the direction of the NEXT thick-box turn and is
+// remembered until that turn uses it (no time limit).
+//
+// nudge = 1 also gives an immediate steering kick toward the box,
+// like the first version did. nudge = 0 (default) stays on the line.
+int nudge = 0;
+
+// How hard the optional nudge steers (added to the PD correction)
 float boxKick = 80.0f;
 
-// How long that steering kick lasts after the box is seen.
-// 120 ms at ~2 m/s pushes the robot a few cm sideways.
+// How long the optional nudge lasts, fading out
 const uint32_t BOX_HOLD_MS = 120;
 
-// Thick box = all three middle sensors dark. The robot pivots
-// for turnMs at turnSpeed, then goes back to following the line.
-int turnSpeed = 170;
-int turnMs = 450;
+// A side box only counts if its sensor stays dark this many
+// consecutive 1 ms samples (rejects specks and noise)
+const uint8_t MARK_MIN_SAMPLES = 3;
 
-// Once a thick box has been handled, ignore it for this long so
-// the same mark cannot trigger a second turn
+// Thick box = all three middle sensors dark for THICK_CONFIRM
+// consecutive samples. The robot then:
+//   1. creeps forward creepMs so the wheels reach the junction
+//   2. spins at turnSpeed until IR3 leaves the dark and finds the
+//      line again, giving up after turnMs
+int turnSpeed = 170;
+int creepMs = 60;
+int turnMs = 1200;
+
+const uint8_t THICK_CONFIRM = 3;
+
+// Once a turn is done, ignore boxes for this long so the same
+// mark cannot trigger a second turn
 const uint32_t TURN_REARM_MS = 300;
 
 // ============================================================
@@ -198,6 +217,10 @@ const uint32_t CONTROL_US = 1000;
 
 // Stop after line is lost for this long
 const uint32_t LOST_STOP_MS = 3000;
+
+// When the line slips off a side, first keep driving in a hard arc
+// toward it for this long (keeps speed), and only then spin in place
+const uint32_t LOST_ARC_MS = 150;
 
 // Button debounce
 const uint32_t BUTTON_DEBOUNCE_MS = 400;
@@ -224,14 +247,27 @@ uint32_t lastButtonPress = 0;
 // BOX STATE
 // ------------------------------------------------------------
 
-// -1 = steer left, +1 = steer right, 0 = no box seen
-float boxBias = 0.0f;
-uint32_t boxBiasUntil = 0;
+// Direction for the next thick-box turn: -1 left, +1 right, 0 none
+int pendingTurn = 0;
 
-// Thick-box turn in progress
-bool turning = false;
+// Side box tracking: dark-sample count, and whether this dark
+// stretch was really something else (a wide box / crossing line)
+uint8_t leftRun = 0;
+uint8_t rightRun = 0;
+bool leftSpoiled = false;
+bool rightSpoiled = false;
+
+// Optional nudge
+int nudgeDir = 0;
+uint32_t nudgeUntil = 0;
+
+// Thick-box turn
+enum Phase { FOLLOW, CREEP, SPIN };
+Phase phase = FOLLOW;
 int turnDir = 0;
-uint32_t turnUntil = 0;
+uint32_t phaseUntil = 0;
+bool spinLeftDark = false;   // IR3 has seen white since the spin began
+uint8_t thickRun = 0;
 uint32_t turnRearmAt = 0;
 
 // ============================================================
@@ -351,7 +387,7 @@ void pivot(int dir) {
 */
 
 __attribute__((always_inline))
-int readSensors(float &error, bool &leftBox, bool &rightBox) {
+int readSensors(float &error, bool &leftBox, bool &rightBox, bool &centre) {
 
   // ONE register read replaces five digitalRead() calls
   const uint32_t gpio = GPIO.in;
@@ -361,6 +397,7 @@ int readSensors(float &error, bool &leftBox, bool &rightBox) {
 
   leftBox  = (active & M_IR1) != 0;
   rightBox = (active & M_IR5) != 0;
+  centre   = (active & M_IR3) != 0;
 
   int   count = 0;
   float sum   = 0.0f;
@@ -376,6 +413,41 @@ int readSensors(float &error, bool &leftBox, bool &rightBox) {
   }
 
   return count;
+}
+
+// ============================================================
+// SIDE BOX TRACKING
+// ============================================================
+
+/*
+  A side box counts once it has PASSED: one outer sensor dark for at
+  least MARK_MIN_SAMPLES, then bright again. If the middle trio went
+  all-dark, or the other outer sensor was dark too, during that
+  stretch, it was a wide thick box or a crossing line, not a side box.
+*/
+void trackSideBox(
+  bool dark,
+  bool otherDark,
+  int midCount,
+  uint8_t &run,
+  bool &spoiled,
+  int dir,
+  uint32_t nowMs
+) {
+  if (dark) {
+    if (run < 255) run++;
+    if (midCount >= 3 || otherDark) spoiled = true;
+    return;
+  }
+
+  if (run >= MARK_MIN_SAMPLES && !spoiled) {
+    pendingTurn = dir;
+    nudgeDir = dir;
+    nudgeUntil = nowMs + BOX_HOLD_MS;
+  }
+
+  run = 0;
+  spoiled = false;
 }
 
 // ============================================================
@@ -467,10 +539,13 @@ void printParams() {
   );
 
   Serial.printf(
-    "boxKick=%.1f  turnSpeed=%d  turnMs=%d\n",
+    "nudge=%d  boxKick=%.1f  turnSpeed=%d  creepMs=%d  turnMs=%d  pending=%d\n",
+    nudge,
     boxKick,
     turnSpeed,
-    turnMs
+    creepMs,
+    turnMs,
+    pendingTurn
   );
 }
 
@@ -562,12 +637,22 @@ void handleSerial() {
 
     case 'w':
       turnMs = constrain((int)value, 0, 2000);
-      Serial.println("Thick-box turn duration updated.");
+      Serial.println("Thick-box turn timeout updated.");
+      break;
+
+    case 'c':
+      creepMs = constrain((int)value, 0, 500);
+      Serial.println("Creep before turn updated.");
+      break;
+
+    case 'y':
+      nudge = (value != 0.0f) ? 1 : 0;
+      Serial.println("Box nudge updated.");
       break;
 
     default:
       Serial.println("Unknown command.");
-      Serial.println("Use: p, d, s, k, m, b, u, w, v, t");
+      Serial.println("Use: p, d, s, k, m, b, u, w, c, y, v, t");
       return;
   }
 
@@ -686,12 +771,13 @@ void loop() {
       lastSide = 0;
 
       // Reset box handling
-      boxBias = 0.0f;
-      boxBiasUntil = 0;
-      turning = false;
-      turnDir = 0;
-      turnUntil = 0;
-      turnRearmAt = 0;
+      pendingTurn = 0;
+      leftRun = rightRun = 0;
+      leftSpoiled = rightSpoiled = false;
+      nudgeUntil = 0;
+      phase = FOLLOW;
+      thickRun = 0;
+      turnRearmAt = millis();
 
       lastCtrl = micros();
 
@@ -732,86 +818,103 @@ void loop() {
   float error = 0.0f;
   bool  leftBox  = false;
   bool  rightBox = false;
+  bool  centre   = false;
 
-  int midCount = readSensors(error, leftBox, rightBox);
+  int midCount = readSensors(error, leftBox, rightBox, centre);
 
   uint32_t nowMs = millis();
 
   // ==========================================================
-  // BOX SEEN BY A SIDE SENSOR
+  // THICK-BOX TURN IN PROGRESS
   // ==========================================================
 
-  /*
-    LEFT  box sensor sees a box -> steer LEFT
-    RIGHT box sensor sees a box -> steer RIGHT
+  if (phase == CREEP) {
 
-    The choice is LATCHED and applied to the next decision, then
-    fades over BOX_HOLD_MS, so it actually moves the robot
-    sideways instead of twitching for a single 1 ms cycle.
-  */
+    // Roll forward so the wheels, not just the sensors, reach the box
+    if ((int32_t)(nowMs - phaseUntil) < 0) {
+      setMotors(turnSpeed, turnSpeed);
+      return;
+    }
 
-  if (leftBox && !rightBox) {
-
-    boxBias = -1.0f;                       // negative = left
-    boxBiasUntil = nowMs + BOX_HOLD_MS;
-  }
-  else if (rightBox && !leftBox) {
-
-    boxBias = 1.0f;                        // positive = right
-    boxBiasUntil = nowMs + BOX_HOLD_MS;
-  }
-  else if (leftBox && rightBox) {
-
-    // Boxes on both sides cancel out
-    boxBias = 0.0f;
-    boxBiasUntil = 0;
+    phase = SPIN;
+    phaseUntil = nowMs + (uint32_t)turnMs;
+    spinLeftDark = !centre;
   }
 
-  // ==========================================================
-  // THICK BOX  (all three middle sensors dark)
-  // ==========================================================
+  if (phase == SPIN) {
 
-  if (turning) {
+    // Spin until IR3 has left the dark and found the line again.
+    // Sensor-guided, so it does not depend on battery level.
+    if (!centre) {
+      spinLeftDark = true;
+    }
 
-    // Still inside a turn: keep pivoting until the timer expires
-    if ((int32_t)(nowMs - turnUntil) < 0) {
+    bool found = spinLeftDark && centre;
 
+    if (!found && (int32_t)(nowMs - phaseUntil) < 0) {
       pivot(turnDir);
       return;
     }
 
-    // Turn finished
-    turning = false;
+    // Turn finished (or timed out - line-lost search takes over)
+    phase = FOLLOW;
     turnRearmAt = nowMs + TURN_REARM_MS;
-
-    // Drop the stale PD state so the robot does not lurch
+    lastSide = turnDir;
     lastError = 0.0f;
     dFilt = 0.0f;
+    lostSince = 0;
   }
-  else if (
-    midCount >= 3 &&
-    (int32_t)(nowMs - turnRearmAt) >= 0
-  ) {
 
-    // Turn toward the box we just passed, otherwise keep turning
-    // the way the line was already curving
-    int dir;
+  // ==========================================================
+  // SIDE BOXES  -> remember the direction of the next turn
+  // ==========================================================
 
-    if (boxBias != 0.0f) {
-      dir = (boxBias < 0.0f) ? -1 : 1;
+  bool armed = (int32_t)(nowMs - turnRearmAt) >= 0;
+
+  if (armed) {
+    trackSideBox(leftBox, rightBox, midCount,
+                 leftRun, leftSpoiled, -1, nowMs);
+    trackSideBox(rightBox, leftBox, midCount,
+                 rightRun, rightSpoiled, 1, nowMs);
+  }
+  else {
+    // Just turned: ignore whatever the spin swept the sensors over
+    leftRun = rightRun = 0;
+    leftSpoiled = rightSpoiled = false;
+  }
+
+  // ==========================================================
+  // THICK BOX  (all three middle sensors dark)  -> TURN
+  // ==========================================================
+
+  if (midCount >= 3 && armed) {
+    if (thickRun < 255) thickRun++;
+  }
+  else {
+    thickRun = 0;
+  }
+
+  if (thickRun >= THICK_CONFIRM) {
+
+    // Turn toward the last side box, else the way the line was
+    // already curving, else right
+    if (pendingTurn != 0) {
+      turnDir = pendingTurn;
     }
     else if (lastSide != 0) {
-      dir = lastSide;
+      turnDir = lastSide;
     }
     else {
-      dir = 1;                             // default: turn right
+      turnDir = 1;
     }
 
-    turnDir = dir;
-    turnUntil = nowMs + (uint32_t)turnMs;
-    turning = true;
+    pendingTurn = 0;
+    nudgeUntil = 0;
+    thickRun = 0;
 
-    pivot(dir);
+    phase = CREEP;
+    phaseUntil = nowMs + (uint32_t)creepMs;
+    setMotors(turnSpeed, turnSpeed);
     return;
   }
 
@@ -821,65 +924,47 @@ void loop() {
 
   if (midCount == 0) {
 
-    // Start lost timer
     if (lostSince == 0) {
-      lostSince = millis();
+      lostSince = nowMs;
     }
 
-    // Stop if lost for too long
-    if ((millis() - lostSince) > LOST_STOP_MS) {
+    uint32_t lostFor = nowMs - lostSince;
+
+    if (lostFor > LOST_STOP_MS) {
 
       stopMotors();
-
       running = false;
-
       Serial.println("LINE LOST - STOPPED");
-
       return;
     }
 
-    // --------------------------------------------------------
-    // Search toward last known line position
-    // --------------------------------------------------------
+    // The line slipped off one side: arc hard toward it first, as if
+    // it were one sensor further out than IR2 / IR4
+    if (lostFor < LOST_ARC_MS && lastSide != 0) {
 
-    if (lastSide > 0) {
-
-      // Last saw line on RIGHT
-      // Spin RIGHT
-      setMotors(
-        pivotSpeed,
-        -pivotSpeed
-      );
-
-    }
-    else if (lastSide < 0) {
-
-      // Last saw line on LEFT
-      // Spin LEFT
-      setMotors(
-        -pivotSpeed,
-        pivotSpeed
-      );
-
+      error = 3.0f * lastSide;
     }
     else {
 
-      // No previous direction
-      // Default: spin right
-      setMotors(
-        pivotSpeed,
-        -pivotSpeed
-      );
-    }
+      // Still lost: spin in place toward where the line was
+      if (lastSide < 0) {
+        setMotors(-pivotSpeed, pivotSpeed);
+      }
+      else {
+        setMotors(pivotSpeed, -pivotSpeed);
+      }
 
-    return;
+      return;
+    }
+  }
+  else {
+
+    lostSince = 0;
   }
 
   // ==========================================================
   // LINE FOUND
   // ==========================================================
-
-  lostSince = 0;
 
   // Remember which side line was last seen
   if (error > 0.5f) {
@@ -913,13 +998,13 @@ void loop() {
     (Kp * proportional) +
     (Kd * dFilt);
 
-  // Add the box steering kick, fading out over BOX_HOLD_MS
-  if (boxBias != 0.0f && (int32_t)(boxBiasUntil - nowMs) > 0) {
+  // Optional nudge toward a side box, fading out over BOX_HOLD_MS
+  if (nudge && (int32_t)(nudgeUntil - nowMs) > 0) {
 
     float weight =
-      (float)(boxBiasUntil - nowMs) / (float)BOX_HOLD_MS;
+      (float)(nudgeUntil - nowMs) / (float)BOX_HOLD_MS;
 
-    correction += boxBias * boxKick * weight;
+    correction += nudgeDir * boxKick * weight;
   }
 
   // ==========================================================

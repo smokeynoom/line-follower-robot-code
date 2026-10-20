@@ -31,21 +31,36 @@ outside watch for the black boxes on the track:
 |---|---|
 | **IR3 (centre)** sees the line | follow it straight |
 | Line drifts under **IR2 / IR4** | PD controller steers back to centre |
-| **IR1 (left box)** sees a box | the **next decision steers LEFT** |
-| **IR5 (right box)** sees a box | the **next decision steers RIGHT** |
-| Box on both sides at once | the two cancel, no bias |
-| **All three middle sensors** dark (thick box) | the robot **TURNS** |
-| No middle sensor sees the line | search turn toward `lastSide`, stop after 3 s |
+| **IR1 (left box)** passes a box | the **next turn goes LEFT** |
+| **IR5 (right box)** passes a box | the **next turn goes RIGHT** |
+| Both outer sensors dark at once | crossing line, ignored |
+| **All three middle sensors** dark (thick box) | creep forward, then **spin until IR3 finds the line** |
+| No middle sensor sees the line | hard arc toward `lastSide` for 150 ms, then spin in place, stop after 3 s |
 
-The outer sensors never enter the line error — a box must not drag the robot off the line.
-Instead each box sets a **latched steering bias** that lands on the next decision and fades out
-over `BOX_HOLD_MS`, so the robot actually shifts sideways instead of twitching for one 1 ms
-cycle. The kick is `boxKick` PWM units, added on top of the PD correction.
+The outer sensors never enter the line error, so a box can't drag the robot off the line.
+A side box counts **once it has passed**: one outer sensor dark for at least 3 ms, then bright
+again. The direction it gives is **remembered until the next thick box uses it**, with no time
+limit. The newest box wins. If the middle three went all dark during that stretch, it was a
+wide thick box and not a side box, so it is ignored.
 
-A **thick box** (all three middle sensors dark) suspends line following: the robot pivots for
-`turnMs` at `turnSpeed`, turning toward the box it just passed, else the way the line was
-already curving, else right. Then it re-acquires the line, and the same mark is ignored for
-`TURN_REARM_MS` so one box cannot trigger two turns.
+A **thick box** has to hold all three middle sensors dark for 3 ms (so one speck can't fire it).
+Then the robot:
+
+1. creeps forward `creepMs` so the wheels, not just the sensors, are over the junction
+2. spins toward the remembered side (else the way the line was curving, else right) **until IR3
+   leaves the dark and finds the line again**, so it doesn't depend on battery level
+   (`turnMs` is only a timeout)
+3. ignores every box for `TURN_REARM_MS`, so the spin sweeping over marks can't queue a
+   bogus turn
+
+### Variants to try on the track
+
+| Switch | What it does |
+|---|---|
+| `y 0` (default) | side box only picks the next turn, robot stays on the line |
+| `y 1` | also nudges toward the box right away (`boxKick`), like the first version |
+| `c 0` | no creep: spin the moment the sensors hit the box (sensors far from the axle) |
+| `c 60`–`c 150` | creep longer if it turns too early and cuts the junction |
 
 ## Parameters you can change over serial
 
@@ -57,16 +72,21 @@ already curving, else right. Then it re-acquires the line, and the same mark is 
 | `slowK` | 20 | `k` | How much it slows down in corners |
 | `minSpeed` | 120 | — | Lowest PWM while tracking |
 | `pivotSpeed` | 180 | `m` | PWM used to spin and re-find the line |
-| `boxKick` | 80 | `b` | Steering kick when a side sensor sees a box |
-| `turnSpeed` | 170 | `u` | PWM for the thick-box pivot turn |
-| `turnMs` | 450 | `w` | Duration of the thick-box pivot turn (ms) |
+| `nudge` | 0 | `y` | 1 = also steer toward a side box right away |
+| `boxKick` | 80 | `b` | Strength of that nudge |
+| `turnSpeed` | 170 | `u` | PWM for the thick-box creep and spin |
+| `creepMs` | 60 | `c` | Drive forward this long before spinning (ms) |
+| `turnMs` | 1200 | `w` | Give up on the spin after this long (ms) |
 
 ## Fixed constants (change in the sketch, re-upload)
 
 | Constant | Value | Meaning |
 |---|---|---|
 | `CONTROL_US` | 1000 | Control period — 1 ms, i.e. 1 kHz |
-| `BOX_HOLD_MS` | 120 | How long a box steer kick lasts |
+| `BOX_HOLD_MS` | 120 | How long the optional nudge lasts |
+| `MARK_MIN_SAMPLES` | 3 | Side box must stay dark this many ms to count |
+| `THICK_CONFIRM` | 3 | Thick box must stay dark this many ms to fire |
+| `LOST_ARC_MS` | 150 | Arc toward a lost line this long before spinning |
 | `TURN_REARM_MS` | 300 | Cooldown before a thick box can trigger again |
 | `LOST_STOP_MS` | 3000 | Stop after the line has been lost this long |
 | `MIN_PWM` | 60 | Dead-zone floor so motors actually turn |
@@ -126,9 +146,11 @@ d 55      set Kd
 s 230     set base speed
 k 18      set corner slow-down
 m 170     set pivot/search speed
-b 80      set box steer kick
+y 1       box nudge on (y 0 = off)
+b 80      set nudge strength
 u 170     set thick-box turn speed
-w 450     set thick-box turn duration (ms)
+c 60      set creep before the turn (ms)
+w 1200    set thick-box turn timeout (ms)
 v         print current parameters
 t         wheel test (robot must be stopped)
 ```
@@ -137,8 +159,10 @@ Tuning, in the order it matters:
 
 - Cuts corners → raise `Kp`. Zig-zags → raise `Kd`.
 - Flies off on fast corners → lower `baseSpeed` or raise `slowK`.
-- Ignores the boxes → raise `boxKick`; shifts too violently → lower it.
-- Overturns on junctions or manhole-sized marks → lower `w` (try 250) or `u` (try 140).
+- Turns the wrong way → `v` shows `pending=` (-1 left, 1 right); slide a box past each side
+  sensor by hand and check it changes.
+- Turns before reaching the junction → raise `c`. Overshoots past it → lower `c`.
+- Spins past the new line → lower `u` (try 140).
 
 ## First-run checklist
 
@@ -156,10 +180,14 @@ Tuning, in the order it matters:
 | `FastLineFollower.ino` | the sketch |
 | `README.md` | this document |
 | `ESP32_LineFollower_Setup.pdf` | printable IDE setup guide with troubleshooting |
+| `test/sim.cpp` | runs the box / turn logic on a PC: `g++ -std=c++17 -Itest/stub -x c++ test/sim.cpp -o sim && ./sim` |
 
 ## Known limits
 
-- The gains are first guesses for the box behaviour — they have not been tested on a track yet.
+- The gains, `creepMs` and `turnSpeed` are first guesses. Only the logic is tested (in the PC
+  simulator), not a real track.
+- A thick box with no side box before it turns toward the last curve direction. If the track
+  means "go straight" there, that needs a rule change.
 - The thick-box rule is defined purely as "three middle sensors dark", so any wide black region
   fires it, not only actual boxes.
 - Detection distance is whatever the IR modules give you; they see the surface, not obstacles
